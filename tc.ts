@@ -1,100 +1,255 @@
-import { Expr, Stmt, Type } from "./ast";
+import { BinOp, Expr, FuncDef, Literal, Program, Stmt, Type, UniOp, VarDef } from "./ast";
 
-type FunctionsEnv = Map<string, [Type[], Type]>;
-type BodyEnv = Map<string, Type>;
+export type GlobalTypeEnv = {
+  vars: Map<string, Type>,
+  funcs: Map<string, [Type[], Type]>,
+}
 
-export function tcExpr(e : Expr<any>, functions : FunctionsEnv, variables : BodyEnv) : Expr<Type> {
-  switch(e.tag) {
-    case "number": return { ...e, a: "int" };
-    case "true": return { ...e, a: "bool" };
-    case "false": return { ...e, a: "bool" };
-    case "binop": {
-      switch(e.op) {
-        case "+": return { ...e, a: "int" };
-        case "-": return { ...e, a: "int" };
-        case ">": return { ...e, a: "bool" };
-        case "and": return { ...e, a: "bool" };
-        case "or": return { ...e, a: "bool" };
-        default: throw new Error(`Unhandled op ${e.op}`)
-      }
+export type LocalTypeEnv = {
+  vars: Map<string, Type>,
+  inFunc: boolean,
+  ret: Type,
+}
+
+export function newLocalTypeEnv(): LocalTypeEnv {
+  return { vars: new Map(), inFunc: false, ret: Type.None };
+}
+
+export function newGlobalTypeEnv(): GlobalTypeEnv {
+  return { vars: new Map(), funcs: new Map() };
+}
+
+export function tc(p: Program<any>): [Program<Type>, GlobalTypeEnv] {
+  const lEnv = newLocalTypeEnv();
+  const gEnv = newGlobalTypeEnv();
+  p.varDefs.forEach((v) => {
+    if (gEnv.vars.has(v.name)) {
+      throw new Error(`Duplicate var name ${v.name}`);
     }
-    case "id": return { ...e, a: variables.get(e.name) };
+    gEnv.vars.set(v.name, v.type);
+  });
+  p.funcDefs.forEach((f) => {
+    if (gEnv.funcs.has(f.name)) {
+      throw new Error(`Duplicate func name ${f.name}`);
+    }
+    gEnv.funcs.set(f.name, [f.params.map((p) => p.typ), f.ret]);
+  })
+  const varDefs = p.varDefs.map((v) => tcVarDef(v));
+  const funcDefs = p.funcDefs.map((f) => tcFuncDef(f, gEnv));
+  const stmts = tcStmts(p.stmts, gEnv, lEnv);
+  var lastTyp = Type.None;
+  if (stmts.length > 0) {
+    lastTyp = stmts[stmts.length - 1].a;
+  }
+
+  return [{ a: lastTyp, varDefs, funcDefs, stmts }, gEnv];
+}
+
+export function tcVarDef(varDef: VarDef<any>): VarDef<Type> {
+  const typ = tcLiteral(varDef.value);
+  if (typ === varDef.type) {
+    return { ...varDef, a: varDef.a };
+  } else {
+    throw new Error(`Type mismatch ${varDef}`);
+  }
+}
+
+export function tcFuncDef(funcDef: FuncDef<any>, gEnv: GlobalTypeEnv): FuncDef<Type> {
+  const lEnv = newLocalTypeEnv();
+  lEnv.inFunc = true;
+  lEnv.ret = funcDef.ret;
+
+  funcDef.params.forEach((p) => {
+    if (lEnv.vars.has(p.name)) {
+      throw new Error(`Duplicate param name ${p.name}`);
+    }
+    lEnv.vars.set(p.name, p.typ);
+  });
+
+  funcDef.varDefs.forEach((v) => {
+    if (lEnv.vars.has(v.name)) {
+      throw new Error(`Duplicate var name ${v.name}`);
+    }
+    lEnv.vars.set(v.name, tcVarDef(v).type);
+  });
+
+  const varDefs = funcDef.varDefs.map((v) => tcVarDef(v));
+  const stmts = tcStmts(funcDef.stmts, gEnv, lEnv);
+  return { ...funcDef, varDefs, stmts };
+}
+
+export function tcStmts(stmts: Stmt<any>[], gEnv: GlobalTypeEnv, lEnv: LocalTypeEnv): Stmt<Type>[] {
+  return stmts.map((s) => tcStmt(s, gEnv, lEnv));
+}
+
+export function tcStmt(stmt: Stmt<any>, gEnv: GlobalTypeEnv, lEnv: LocalTypeEnv): Stmt<Type> {
+  switch (stmt.tag) {
+    case "assign":
+      const value = tcExpr(stmt.value, gEnv, lEnv);
+      return { ...stmt, value, a: Type.None };
+    case "if":
+      const ifCond = tcExpr(stmt.iff.cond, gEnv, lEnv);
+      if (ifCond.a !== Type.Bool) {
+        throw new Error(`Type error of if cond`);
+      }
+      const ifThn = tcStmts(stmt.iff.thn, gEnv, lEnv);
+      const els = tcStmts(stmt.els, gEnv, lEnv);
+
+      if (stmt.elif.length === 0) {
+        return {
+          ...stmt,
+          iff: { ...stmt.iff, cond: ifCond, thn: ifThn, a: ifThn[ifThn.length - 1].a },
+          els,
+          a: ifThn[ifThn.length - 1].a,
+        }
+      } else {
+        const elifCond = tcExpr(stmt.elif[0].cond, gEnv, lEnv);
+        if (elifCond.a !== Type.Bool) {
+          throw new Error(`Type error of elif cond`);
+        }
+        const elifThn = tcStmts(stmt.elif[0].thn, gEnv, lEnv);
+        return {
+          ...stmt,
+          iff: { ...stmt.iff, cond: ifCond, thn: ifThn, a: ifThn[ifThn.length - 1].a },
+          elif: [{ ...stmt.elif[0], cond: elifCond, thn: elifThn, a: elifThn[elifThn.length - 1].a }],
+          els,
+          a: ifThn[ifThn.length - 1].a,
+        }
+      }
+    case "while":
+      const whileCond = tcExpr(stmt.cond, gEnv, lEnv);
+      if (whileCond.a !== Type.Bool) {
+        throw new Error(`Type error of while cond`);
+      }
+      const whileStmts = tcStmts(stmt.stmts, gEnv, lEnv);
+      return { ...stmt, cond: whileCond, stmts: whileStmts, a: Type.None };
+    case "pass":
+      return { ...stmt, a: Type.None };
+    case "return":
+      if (!lEnv.inFunc) {
+        throw new Error(`Not in func`);
+      }
+      const ret = tcExpr(stmt.value, gEnv, lEnv);
+      if (ret.a !== lEnv.ret) {
+        throw new Error(`Mismatch return type`);
+      }
+      return { ...stmt, value: ret, a: ret.a };
+    case "expr":
+      const expr = tcExpr(stmt.expr, gEnv, lEnv);
+      return { ...stmt, expr, a: expr.a };
+  }
+}
+
+export function tcExpr(expr: Expr<any>, gEnv: GlobalTypeEnv, lEnv: LocalTypeEnv): Expr<Type> {
+  switch (expr.tag) {
+    case "literal":
+      const lit = tcLiteral(expr.value);
+      return { ...expr, a: lit };
+    case "id":
+      if (lEnv.vars.has(expr.name)) {
+        return { ...expr, a: lEnv.vars.get(expr.name) };
+      } else if (gEnv.vars.has(expr.name)) {
+        return { ...expr, a: gEnv.vars.get(expr.name) };
+      } else {
+        throw new Error(`Unknown var ${expr.name}`);
+      }
+    case "uniop":
+      const uniExpr = tcExpr(expr.expr, gEnv, lEnv);
+      const uniOp = { ...expr, a: uniExpr.a, expr: uniExpr }
+      switch (expr.op) {
+        case UniOp.Neg:
+          if (uniExpr.a !== Type.Int) {
+            throw new Error(`Unsupported operand type ${uniExpr.a} for Neg`);
+          }
+          return uniOp;
+        case UniOp.Not:
+          if (uniExpr.a !== Type.Bool) {
+            throw new Error(`Unsupported operand type ${uniExpr.a} for Not`);
+          }
+          return uniOp;
+        default:
+          throw new Error(`Unsupported uni op`);
+      }
+    case "binop":
+      const left = tcExpr(expr.left, gEnv, lEnv);
+      const right = tcExpr(expr.right, gEnv, lEnv);
+      const binOp = { ...expr, a: left, right };
+      switch (expr.op) {
+        case BinOp.Plus:
+        case BinOp.Minus:
+        case BinOp.Mul:
+        case BinOp.Div:
+        case BinOp.Mod:
+          if (left.a !== Type.Int || right.a !== Type.Int) {
+            throw new Error(`Unsupported operand`);
+          }
+          return { ...binOp, a: Type.Int };
+        case BinOp.Eq:
+        case BinOp.Neq:
+          if (left.a !== right.a) {
+            throw new Error(`Operand type mismatch`);
+          }
+          return { ...binOp, a: Type.Bool };
+        case BinOp.Lte:
+        case BinOp.Gte:
+        case BinOp.Lt:
+        case BinOp.Gt:
+          if (left.a !== Type.Int || right.a !== Type.Int) {
+            throw new Error(`Unsupported operand`);
+          }
+          return { ...binOp, a: Type.Bool };
+        case BinOp.Is:
+          if (left.a !== Type.None || right.a !== Type.None) {
+            throw new Error(`Unsupported operand`);
+          }
+          return { ...binOp, a: Type.Bool };
+        default:
+          new Error(`Unsupported bin op`);
+      }
     case "call":
-      if(e.name === "print") {
-        if(e.args.length !== 1) { throw new Error("print expects a single argument"); }
-        const newArgs = [tcExpr(e.args[0], functions, variables)];
-        const res : Expr<Type> = { ...e, a: "none", args: newArgs } ;
-        return res;
+      if (!gEnv.funcs.has(expr.name)) {
+        throw new Error(`Unknown func ${expr.name}`);
       }
-      if(!functions.has(e.name)) {
-        throw new Error(`function ${e.name} not found`);
+      var [argTyps, retTyp] = gEnv.funcs.get(expr.name);
+      const args = expr.args.map((a) => tcExpr(a, gEnv, lEnv));
+      if (argTyps.length !== args.length) {
+        throw new Error(`Mismatch arg number of func ${expr.name}`);
       }
-
-      const [args, ret] = functions.get(e.name);
-      if(args.length !== e.args.length) {
-        throw new Error(`Expected ${args.length} arguments but got ${e.args.length}`);
-      }
-
-      const newArgs = args.map((a, i) => {
-        const argtyp = tcExpr(e.args[i], functions, variables);
-        if(a !== argtyp.a) { throw new Error(`Got ${argtyp} as argument ${i + 1}, expected ${a}`); }
-        return argtyp
+      args.forEach((arg, idx) => {
+        if (arg.a !== argTyps[idx]) {
+          throw new Error(`Mismatch arg type of func ${expr.name}`);
+        }
       });
-
-      return { ...e, a: ret, args: newArgs };
+      return { ...expr, args, a: retTyp};
+    case "builtin1":
+      if (expr.name === "print") {
+        const arg = tcExpr(expr.arg, gEnv, lEnv);
+        return { ...expr, arg, a: arg.a };
+      }
+      // todo
+      return { ...expr };
+    case "builtin2":
+      // todo
+      return { ...expr };
+    // const arg1 = tcExpr(expr.arg1);
+    // const arg2 = tcExpr(expr.arg2);
+    // if (arg1.a !== Type.Int)
+    //   throw new Error("Type error: arg1 must be int");
+    // if (arg2.a !== Type.Int)
+    //   throw new Error("Type error: arg2 must be int");
+    // return { ...expr, arg1, arg2, a: Type.Int };
   }
 }
 
-export function tcStmt(s : Stmt<any>, functions : FunctionsEnv, variables : BodyEnv, currentReturn : Type) : Stmt<Type> {
-  switch(s.tag) {
-    case "assign": {
-      const rhs = tcExpr(s.value, functions, variables);
-      if(variables.has(s.name) && variables.get(s.name) !== rhs.a) {
-        throw new Error(`Cannot assign ${rhs} to ${variables.get(s.name)}`);
-      }
-      else {
-        variables.set(s.name, rhs.a);
-      }
-      return { ...s, value: rhs };
-    }
-    case "define": {
-      const bodyvars = new Map<string, Type>(variables.entries());
-      s.params.forEach(p => { bodyvars.set(p.name, p.typ)});
-      const newStmts = s.body.map(bs => tcStmt(bs, functions, bodyvars, s.ret));
-      return { ...s, body: newStmts };
-    }
-    case "expr": {
-      const ret = tcExpr(s.expr, functions, variables);
-      return { ...s, expr: ret };
-    }
-    case "return": {
-      const valTyp = tcExpr(s.value, functions, variables);
-      if(valTyp.a !== currentReturn) {
-        throw new Error(`${valTyp} returned but ${currentReturn} expected.`);
-      }
-      return { ...s, value: valTyp };
-    }
+export function tcLiteral(literal: Literal): Type {
+  switch (literal.tag) {
+    case "number":
+      return Type.Int;
+    case "bool":
+      return Type.Bool;
+    case "none":
+      return Type.None;
+    default:
+      throw new Error(`Unhandled literal ${literal}`);
   }
-}
-
-export function tcProgram(p : Stmt<any>[]) : Stmt<Type>[] {
-  const functions = new Map<string, [Type[], Type]>();
-  p.forEach(s => {
-    if(s.tag === "define") {
-      functions.set(s.name, [s.params.map(p => p.typ), s.ret]);
-    }
-  });
-
-  const globals = new Map<string, Type>();
-  return p.map(s => {
-    if(s.tag === "assign") {
-      const rhs = tcExpr(s.value, functions, globals);
-      globals.set(s.name, rhs.a);
-      return { ...s, value: rhs };
-    }
-    else {
-      const res = tcStmt(s, functions, globals, "none");
-      return res;
-    }
-  });
 }
